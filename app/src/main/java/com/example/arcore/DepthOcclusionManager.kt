@@ -29,6 +29,28 @@ class DepthOcclusionManager {
     private const val MAX_DEPTH_HEIGHT = 480
     // Occlusion margin in meters to avoid z-fighting on object boundaries
     private const val OCCLUSION_TOLERANCE_METERS = 0.04f
+
+    /**
+     * Canonical GPU GLSL shader depth reconstruction function for GL_LUMINANCE_ALPHA depth textures.
+     * Reconstructs physical 16-bit depth in meters matching CPU depth unpacking.
+     */
+    const val GLSL_DEPTH_RECONSTRUCTION_SNIPPET = """
+      float reconstructPhysicalDepthMeters(sampler2D depthTexture, vec2 depthUv) {
+        vec4 packedDepth = texture2D(depthTexture, depthUv);
+        // Luminance (R) = low byte (depthMm & 0xFF)
+        // Alpha (A) = high byte ((depthMm >> 8) & 0xFF)
+        float depthMm = (packedDepth.r * 255.0) + (packedDepth.a * 255.0 * 256.0);
+        if (depthMm < 80.0 || depthMm > 15000.0) {
+          return 0.0; // Invalid / unmeasured
+        }
+        return depthMm / 1000.0;
+      }
+      
+      bool isVirtualFragmentOccluded(float virtualViewDepthMeters, float physicalDepthMeters, float toleranceMeters) {
+        if (physicalDepthMeters <= 0.08) return false;
+        return physicalDepthMeters < (virtualViewDepthMeters - toleranceMeters);
+      }
+    """
   }
 
   // GPU Texture state
@@ -70,6 +92,10 @@ class DepthOcclusionManager {
   var isConfidenceAvailable: Boolean = false
     private set
   var depthConfidencePercentage: Float? = null
+    private set
+  var isSynchronizedWithCamera: Boolean = false
+    private set
+  var frameSyncDeltaNs: Long = 0L
     private set
   // Legacy score field maintained for backward compatibility (returns actual confidence if available, else coverage)
   val depthConfidenceScore: Float
@@ -118,6 +144,22 @@ class DepthOcclusionManager {
       val height = depthImage.height
       val planes = depthImage.planes
       if (planes.isEmpty()) return
+
+      // Synchronize depth frame with camera frame timestamp
+      val depthTimestampNs = depthImage.timestamp
+      val cameraTimestampNs = frame.timestamp
+      latestDepthTimestampNs = depthTimestampNs
+      frameSyncDeltaNs = Math.abs(cameraTimestampNs - depthTimestampNs)
+      // Frame is considered synchronized if within ~2 frames at 30fps (66ms)
+      isSynchronizedWithCamera = frameSyncDeltaNs <= 66_000_000L
+
+      if (!isSynchronizedWithCamera) {
+        // Desynchronized depth frame: camera has moved and optical axes will not align.
+        // Skip occlusion evaluation to prevent projection misalignment artifacts.
+        isOcclusionDetected = false
+        occlusionPercentage = 0f
+        return
+      }
 
       val plane = planes[0]
       val buffer: ByteBuffer = plane.buffer.order(ByteOrder.LITTLE_ENDIAN)
@@ -230,21 +272,57 @@ class DepthOcclusionManager {
       }
 
       // Multi-point per-pixel occlusion validation for virtual anchors
+      // STRICT REQUIREMENT: Depth must be derived from camera pose, NOT world origin
       var occludedCount = 0
       var totalTestedPoints = 0
+
+      val camPose = frame.camera.pose
+      val camTx = camPose.tx()
+      val camTy = camPose.ty()
+      val camTz = camPose.tz()
+
+      val viewMatrix = FloatArray(16)
+      val projMatrix = FloatArray(16)
+      val viewProjMatrix = FloatArray(16)
+      frame.camera.getViewMatrix(viewMatrix, 0)
+      frame.camera.getProjectionMatrix(projMatrix, 0, 0.05f, 50.0f)
+      android.opengl.Matrix.multiplyMM(viewProjMatrix, 0, projMatrix, 0, viewMatrix, 0)
+
       for (anchorPose in virtualAnchorPoses) {
-        val virtualDistMeters = Math.sqrt(
-          (anchorPose.tx() * anchorPose.tx() +
-           anchorPose.ty() * anchorPose.ty() +
-           anchorPose.tz() * anchorPose.tz()).toDouble()
-        ).toFloat()
+        // Transform anchor into camera space to measure real optical depth along camera optical axis (-Z)
+        // Camera-relative view-space Z: identical coordinate frame to ARCore depth image
+        val poseInCameraSpace = camPose.inverse().compose(anchorPose)
+        val cameraSpaceZ = -poseInCameraSpace.tz() // Optical forward axis is -Z in camera view space
+
+        // If behind camera near plane or at eye level, skip occlusion check
+        if (cameraSpaceZ <= 0.05f) continue
+
+        // Strictly camera-relative view-space optical depth (matches physical depth buffer measurements)
+        val virtualDepthMeters = cameraSpaceZ
+
+        // Project 3D anchor position into screen-space normalized coordinates [0..1]
+        val clip = FloatArray(4)
+        val worldP = floatArrayOf(anchorPose.tx(), anchorPose.ty(), anchorPose.tz(), 1.0f)
+        android.opengl.Matrix.multiplyMV(clip, 0, viewProjMatrix, 0, worldP, 0)
+
+        val centerScreenX: Float
+        val centerScreenY: Float
+        if (clip[3] > 0.001f) {
+          val ndcX = clip[0] / clip[3]
+          val ndcY = clip[1] / clip[3]
+          centerScreenX = ((ndcX + 1.0f) * 0.5f).coerceIn(0.05f, 0.95f)
+          centerScreenY = ((1.0f - ndcY) * 0.5f).coerceIn(0.05f, 0.95f)
+        } else {
+          centerScreenX = 0.5f
+          centerScreenY = 0.5f
+        }
 
         val samplePoints = arrayOf(
-          0.5f to 0.5f,
-          0.47f to 0.47f,
-          0.53f to 0.53f,
-          0.47f to 0.53f,
-          0.53f to 0.47f
+          centerScreenX to centerScreenY,
+          (centerScreenX - 0.03f).coerceIn(0.01f, 0.99f) to (centerScreenY - 0.03f).coerceIn(0.01f, 0.99f),
+          (centerScreenX + 0.03f).coerceIn(0.01f, 0.99f) to (centerScreenY + 0.03f).coerceIn(0.01f, 0.99f),
+          (centerScreenX - 0.03f).coerceIn(0.01f, 0.99f) to (centerScreenY + 0.03f).coerceIn(0.01f, 0.99f),
+          (centerScreenX + 0.03f).coerceIn(0.01f, 0.99f) to (centerScreenY - 0.03f).coerceIn(0.01f, 0.99f)
         )
         for ((sx, sy) in samplePoints) {
           totalTestedPoints++
@@ -252,7 +330,7 @@ class DepthOcclusionManager {
             frame = frame,
             viewX = sx,
             viewY = sy,
-            virtualDepthMeters = virtualDistMeters
+            virtualDepthMeters = virtualDepthMeters
           )
           if (isOccluded) occludedCount++
         }
@@ -344,6 +422,8 @@ class DepthOcclusionManager {
     depthCoveragePercentage = 0f
     depthConfidencePercentage = null
     isConfidenceAvailable = false
+    isSynchronizedWithCamera = false
+    frameSyncDeltaNs = 0L
   }
 
   fun destroy() {

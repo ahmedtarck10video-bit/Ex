@@ -272,6 +272,8 @@ fun MixedRealityScreen(
         cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
       },
       onDualCameraCreated = { dualView ->
+        dualView.arCoreSessionManager = spatialSurfaceView.arCoreSessionManager
+        dualView.depthOcclusionManager = spatialSurfaceView.depthOcclusionManager
         dualView.onCameraTextureReady = { texName ->
           spatialSurfaceView.arCoreSessionManager.setCameraTextureName(texName)
         }
@@ -329,11 +331,22 @@ fun MixedRealityScreen(
       )
     }
 
+    var isTrackingRecoveryDismissed by remember { mutableStateOf(false) }
+
+    // Reset dismissed state when tracking becomes valid again
+    LaunchedEffect(telemetry.arTrackingStatus) {
+      if (telemetry.arTrackingStatus.startsWith("TRACKING")) {
+        isTrackingRecoveryDismissed = false
+      }
+    }
+
     // Explicit Tracking Recovery Affordance (Point 10: Surface explicit tracking-recovery affordance when tracking lost)
     val isTrackingLost = (displayMode == DisplayMode.AR || displayMode == DisplayMode.MR) &&
       hasCameraPermission &&
-      telemetry.arTrackingStatus != "TRACKING" &&
-      telemetry.arTrackingStatus != "UNINITIALIZED"
+      !isTrackingRecoveryDismissed &&
+      !telemetry.arTrackingStatus.startsWith("TRACKING") &&
+      telemetry.arTrackingStatus != "UNINITIALIZED" &&
+      (telemetry.activeAnchorsCount > 0 || telemetry.arTrackingStatus.startsWith("PAUSED"))
 
     TrackingRecoveryCard(
       isVisible = isTrackingLost,
@@ -341,6 +354,11 @@ fun MixedRealityScreen(
       onRecenterClick = {
         hapticManager.performClick()
         spatialSurfaceView.arCoreSessionManager.resetWalkingOrigin()
+        isTrackingRecoveryDismissed = true
+      },
+      onDismiss = {
+        hapticManager.performClick()
+        isTrackingRecoveryDismissed = true
       },
       modifier = Modifier
         .fillMaxWidth()

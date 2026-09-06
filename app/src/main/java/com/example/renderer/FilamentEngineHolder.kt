@@ -42,6 +42,37 @@ import kotlin.math.sin
 import kotlin.math.tan
 
 /**
+ * Clean architectural abstraction for Filament Material depth comparison functions.
+ * Decouples the material rasterizer depth test from the TextureSampler compare mode
+ * to avoid conflating sampler sampling states with pipeline rasterization states.
+ */
+enum class FilamentMaterialDepthFunc(val filamentCompareFunc: TextureSampler.CompareFunction) {
+  LESS(TextureSampler.CompareFunction.LESS),
+  LESS_EQUAL(TextureSampler.CompareFunction.LESS_EQUAL),
+  GREATER(TextureSampler.CompareFunction.GREATER),
+  GREATER_EQUAL(TextureSampler.CompareFunction.GREATER_EQUAL),
+  EQUAL(TextureSampler.CompareFunction.EQUAL),
+  NOT_EQUAL(TextureSampler.CompareFunction.NOT_EQUAL),
+  ALWAYS(TextureSampler.CompareFunction.ALWAYS),
+  NEVER(TextureSampler.CompareFunction.NEVER);
+
+  companion object {
+    /**
+     * Filament utilizes a reversed-Z depth buffer (near plane = 1.0, far plane = 0.0).
+     * Therefore, GREATER_EQUAL is the standard pass condition for geometry in front of the far plane.
+     */
+    val REVERSED_Z_DEFAULT = GREATER_EQUAL
+  }
+}
+
+/**
+ * Extension method to apply the material depth function cleanly without mixing with TextureSampler logic.
+ */
+fun MaterialInstance.setMaterialDepthFunc(func: FilamentMaterialDepthFunc) {
+  this.setDepthFunc(func.filamentCompareFunc)
+}
+
+/**
  * Representation of a 3D model instantiated inside the Filament 3D Scene,
  * linked to a real ARCore 6DoF Anchor (from physical Plane or Image Marker).
  */
@@ -57,7 +88,11 @@ data class ActiveSceneExhibit(
   var customRotationDeg: Float = 0.0f,
   val physicalWidthMeters: Float = 1.0f,
   val physicalHeightMeters: Float = 1.0f,
-  val physicalDepthMeters: Float = 1.0f
+  val physicalDepthMeters: Float = 1.0f,
+  val centerOffsetX: Float = 0f,
+  val centerOffsetY: Float = 0f,
+  val centerOffsetZ: Float = 0f,
+  val physicalHalfHeight: Float = 0f
 )
 
 /**
@@ -233,12 +268,11 @@ class FilamentEngineHolder(private val context: Context) {
           try { mat.setParameter("u_depthOcclusionActive", 1.0f) } catch (_: Throwable) {}
         }
 
-        // Real GPU fragment occlusion: retain standard rendering pipeline for per-fragment depth testing
-        // Do NOT rely on global occlusionPercentage to hide or threshold an entire object
+        // Audit enable path: configure rasterizer state with FilamentMaterialDepthFunc
         mat.setColorWrite(true)
         mat.setDepthWrite(true)
         mat.setDepthCulling(true)
-        mat.setDepthFunc(TextureSampler.CompareFunction.LESS_EQUAL)
+        mat.setMaterialDepthFunc(FilamentMaterialDepthFunc.REVERSED_Z_DEFAULT)
       }
 
       val rm = eng.renderableManager
@@ -256,7 +290,9 @@ class FilamentEngineHolder(private val context: Context) {
           rm.setPriority(inst, 4)
         }
       }
-      isDepthTextureBoundToPipeline = true
+      // Mark GPU depth occlusion active when depth texture is uploaded to the pipeline
+      isDepthTextureBoundToPipeline = filamentDepthTexture != null
+      isGpuDepthOcclusionActive = filamentDepthTexture != null && isReady && textureId != 0
     } else {
       val allMaterials = mutableListOf<MaterialInstance>()
       currentAsset?.instance?.materialInstances?.let {
@@ -272,13 +308,33 @@ class FilamentEngineHolder(private val context: Context) {
         if (matDef.hasParameter("u_depthOcclusionActive")) {
           try { mat.setParameter("u_depthOcclusionActive", 0.0f) } catch (_: Throwable) {}
         }
+        // Audit disable path: reset rasterizer state with FilamentMaterialDepthFunc
         mat.setColorWrite(true)
         mat.setDepthWrite(true)
         mat.setDepthCulling(true)
-        mat.setDepthFunc(TextureSampler.CompareFunction.LESS_EQUAL)
+        mat.setMaterialDepthFunc(FilamentMaterialDepthFunc.REVERSED_Z_DEFAULT)
       }
       isDepthTextureBoundToPipeline = false
+      isGpuDepthOcclusionActive = false
     }
+  }
+
+  /**
+   * Resets GPU depth textures and pipelines on tracking loss or ARCore session recreation.
+   */
+  fun clearGpuDepthAndTrackingResources() {
+    val eng = engine
+    if (eng != null && filamentDepthTexture != null) {
+      try {
+        filamentDepthTexture?.let { eng.destroyTexture(it) }
+      } catch (_: Exception) {}
+      filamentDepthTexture = null
+    }
+    lastImportedTextureId = 0
+    depthTextureId = 0
+    isGpuDepthOcclusionActive = false
+    isDepthTextureBoundToPipeline = false
+    currentOcclusionPercentage = 0f
   }
 
   // Surface Dimensions
@@ -350,10 +406,14 @@ class FilamentEngineHolder(private val context: Context) {
     private set
   var baseCenterOffsetZ: Float = 0f
     private set
+  var modelPhysicalHalfHeight: Float = 0f
+    private set
 
   // Preallocated zero-allocation scratch buffers for high-frequency render loops
   private val scratchProjDouble = DoubleArray(16)
   private val scratchViewDouble = DoubleArray(16)
+  private val scratchCamModelMatrix = FloatArray(16)
+  private val scratchCamModelDouble = DoubleArray(16)
   private val scratchLeftEyeMatrix = FloatArray(16)
   private val scratchRightEyeMatrix = FloatArray(16)
   private val scratchLeftProjMatrix = FloatArray(16)
@@ -546,9 +606,11 @@ class FilamentEngineHolder(private val context: Context) {
         modelPhysicalHeightMeters = halfExtents[1] * 2.0f
         modelPhysicalDepthMeters = halfExtents[2] * 2.0f
 
+        // Center model geometry at local centroid so rotation spins cleanly around center
         baseCenterOffsetX = -center[0]
-        baseCenterOffsetY = -center[1] + halfExtents[1]
+        baseCenterOffsetY = -center[1]
         baseCenterOffsetZ = -center[2]
+        modelPhysicalHalfHeight = halfExtents[1]
 
         val tm = eng.transformManager
         val rootInstance = tm.getInstance(asset.root)
@@ -575,7 +637,7 @@ class FilamentEngineHolder(private val context: Context) {
 
   /**
    * Updates root transform for current primary asset in Object Mode.
-   * Model remains centered at origin, responsive to user gestures without compounding.
+   * Model remains stable, cleanly centered, fully visible and above the bottom controls.
    */
   fun updateObjectModeTransform() {
     val eng = engine ?: return
@@ -584,14 +646,15 @@ class FilamentEngineHolder(private val context: Context) {
     val rootInst = tm.getInstance(asset.root)
     if (rootInst != 0) {
       Matrix.setIdentityM(scratchModelMatrix, 0)
-      Matrix.translateM(scratchModelMatrix, 0, modelOffsetX, modelOffsetY, modelOffsetZ)
+      // Elevate slightly (+0.08m) so it is centered and fully visible above bottom controls
+      Matrix.translateM(scratchModelMatrix, 0, 0f, 0.08f, 0f)
       if (modelRotationDegrees != 0f) {
         Matrix.rotateM(scratchModelMatrix, 0, modelRotationDegrees, 0f, 1f, 0f)
       }
       if (modelPitchDegrees != 0f) {
         Matrix.rotateM(scratchModelMatrix, 0, modelPitchDegrees, 1f, 0f, 0f)
       }
-      val scale = modelScale.coerceIn(0.02f, 25.0f)
+      val scale = modelScale.coerceIn(0.6f, 3.0f)
       Matrix.scaleM(scratchModelMatrix, 0, scale, scale, scale)
       Matrix.translateM(scratchModelMatrix, 0, baseCenterOffsetX, baseCenterOffsetY, baseCenterOffsetZ)
       tm.setTransform(rootInst, scratchModelMatrix)
@@ -659,7 +722,11 @@ class FilamentEngineHolder(private val context: Context) {
         anchor = anchor,
         physicalWidthMeters = w,
         physicalHeightMeters = h,
-        physicalDepthMeters = d
+        physicalDepthMeters = d,
+        centerOffsetX = -center[0],
+        centerOffsetY = -center[1],
+        centerOffsetZ = -center[2],
+        physicalHalfHeight = halfExtents[1]
       )
 
       activeExhibits.add(exhibit)
@@ -756,10 +823,21 @@ class FilamentEngineHolder(private val context: Context) {
     val cam = camera ?: return
     for (i in 0 until 16) {
       scratchProjDouble[i] = projectionMatrix[i].toDouble()
-      scratchViewDouble[i] = viewMatrix[i].toDouble()
     }
     cam.setCustomProjection(scratchProjDouble, 0.05, 100.0)
-    cam.setModelMatrix(scratchViewDouble)
+
+    // Filament Camera.setModelMatrix requires camera world pose (inverse of ARCore view matrix)
+    if (Matrix.invertM(scratchCamModelMatrix, 0, viewMatrix, 0)) {
+      for (i in 0 until 16) {
+        scratchCamModelDouble[i] = scratchCamModelMatrix[i].toDouble()
+      }
+      cam.setModelMatrix(scratchCamModelDouble)
+    } else {
+      for (i in 0 until 16) {
+        scratchViewDouble[i] = viewMatrix[i].toDouble()
+      }
+      cam.setModelMatrix(scratchViewDouble)
+    }
   }
 
   fun updateOrbitCamera() {
@@ -774,12 +852,13 @@ class FilamentEngineHolder(private val context: Context) {
     val radPitch = Math.toRadians(orbitPitch.toDouble())
     val radYaw = Math.toRadians(totalYaw.toDouble())
 
-    val eyeX = (orbitDistance * cos(radPitch) * sin(radYaw) + panX).toDouble()
-    val eyeY = (orbitDistance * sin(radPitch) + panY).toDouble()
-    val eyeZ = (orbitDistance * cos(radPitch) * cos(radYaw)).toDouble()
+    val dist = orbitDistance.coerceIn(1.8f, 3.2f)
+    val eyeX = (dist * cos(radPitch) * sin(radYaw) + panX).toDouble()
+    val eyeY = (dist * sin(radPitch) + panY + 0.08).toDouble()
+    val eyeZ = (dist * cos(radPitch) * cos(radYaw)).toDouble()
 
     val targetX = panX.toDouble()
-    val targetY = panY.toDouble()
+    val targetY = panY.toDouble() + 0.08
     val targetZ = 0.0
 
     val aspect = surfaceWidth.toDouble() / maxOf(surfaceHeight.toDouble(), 1.0)
@@ -816,8 +895,9 @@ class FilamentEngineHolder(private val context: Context) {
           Matrix.rotateM(scratchModelMatrix, 0, modelPitchDegrees, 1f, 0f, 0f)
         }
 
-        val scale = (exhibit.customScale * modelScale).coerceIn(0.02f, 25.0f)
+        val scale = (exhibit.customScale * modelScale).coerceIn(0.1f, 8.0f)
         Matrix.scaleM(scratchModelMatrix, 0, scale, scale, scale)
+        Matrix.translateM(scratchModelMatrix, 0, exhibit.centerOffsetX, exhibit.centerOffsetY + exhibit.physicalHalfHeight, exhibit.centerOffsetZ)
 
         val rootInst = tm.getInstance(exhibit.asset.root)
         if (rootInst != 0) {
@@ -899,8 +979,8 @@ class FilamentEngineHolder(private val context: Context) {
         cam.setModelMatrix(scratchViewDouble)
       } else {
         cam.lookAt(
-          -halfIpd.toDouble(), 0.0, orbitDistance.toDouble(),
-          0.0, 0.0, 0.0,
+          -halfIpd.toDouble(), 0.08, orbitDistance.toDouble(),
+          0.0, 0.08, 0.0,
           0.0, 1.0, 0.0
         )
       }
@@ -925,8 +1005,8 @@ class FilamentEngineHolder(private val context: Context) {
         cam.setModelMatrix(scratchViewDouble)
       } else {
         cam.lookAt(
-          halfIpd.toDouble(), 0.0, orbitDistance.toDouble(),
-          0.0, 0.0, 0.0,
+          halfIpd.toDouble(), 0.08, orbitDistance.toDouble(),
+          0.0, 0.08, 0.0,
           0.0, 1.0, 0.0
         )
       }
@@ -1023,9 +1103,9 @@ class FilamentEngineHolder(private val context: Context) {
       if (modelPitchDegrees != 0f) {
         Matrix.rotateM(scratchModelMatrix, 0, modelPitchDegrees, 1f, 0f, 0f)
       }
-      val scale = modelScale.coerceIn(0.02f, 25.0f)
+      val scale = modelScale.coerceIn(0.1f, 8.0f)
       Matrix.scaleM(scratchModelMatrix, 0, scale, scale, scale)
-      Matrix.translateM(scratchModelMatrix, 0, baseCenterOffsetX, baseCenterOffsetY, baseCenterOffsetZ)
+      Matrix.translateM(scratchModelMatrix, 0, baseCenterOffsetX, baseCenterOffsetY + modelPhysicalHalfHeight, baseCenterOffsetZ)
       tm.setTransform(rootInst, scratchModelMatrix)
     }
   }

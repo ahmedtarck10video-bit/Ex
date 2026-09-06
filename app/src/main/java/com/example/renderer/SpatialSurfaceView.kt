@@ -60,6 +60,19 @@ class SpatialSurfaceView @JvmOverloads constructor(
   val depthOcclusionManager = DepthOcclusionManager()
 
   var dualCameraGLSurfaceView: DualCameraGLSurfaceView? = null
+    set(value) {
+      field = value
+      value?.arCoreSessionManager = arCoreSessionManager
+      value?.depthOcclusionManager = depthOcclusionManager
+      value?.displayMode = displayMode
+      if (value != null && (displayMode == DisplayMode.AR || displayMode == DisplayMode.MR)) {
+        val tex = value.textureId
+        if (tex != 0) {
+          arCoreSessionManager.setCameraTextureName(tex)
+          (context as? Activity)?.let { arCoreSessionManager.resumeSession(it) }
+        }
+      }
+    }
 
   private var isSurfaceReady = false
   private var isRendering = false
@@ -115,9 +128,18 @@ class SpatialSurfaceView @JvmOverloads constructor(
   private var lastDepthTimeMs: Long = 0L
   private var lastLodTimeMs: Long = 0L
 
+  // Retained head pose matrix for graceful tracking loss recovery (no black screen or sudden jump)
+  private val lastValidHeadPoseMatrix = FloatArray(16).apply {
+    android.opengl.Matrix.setIdentityM(this, 0)
+  }
+  private var hasStoredHeadPose: Boolean = false
+  // Map of last valid pose per anchor hash to hold anchors in world space during tracking pause
+  private val anchorLastKnownPoses = mutableMapOf<Int, Pose>()
+
   // Gesture state: seamless finger interaction for Rotate, Move, and Scale
   private var isOneFingerRotateMode: Boolean = false
   private var lastTapTime: Long = 0L
+  private var consecutiveNullFrames: Int = 0
 
   private var sensorPitch = 0f
   private var sensorRoll = 0f
@@ -157,9 +179,9 @@ class SpatialSurfaceView @JvmOverloads constructor(
         override fun onScale(detector: ScaleGestureDetector): Boolean {
           val scaleFactor = detector.scaleFactor
           if (displayMode == DisplayMode.OBJECT) {
-            filamentEngine.orbitDistance = (filamentEngine.orbitDistance / scaleFactor).coerceIn(0.5f, 15.0f)
+            filamentEngine.orbitDistance = (filamentEngine.orbitDistance / scaleFactor).coerceIn(1.8f, 3.2f)
           } else {
-            filamentEngine.modelScale = (filamentEngine.modelScale * scaleFactor).coerceIn(0.02f, 25.0f)
+            filamentEngine.modelScale = (filamentEngine.modelScale * scaleFactor).coerceIn(0.2f, 5.0f)
           }
           return true
         }
@@ -302,18 +324,18 @@ class SpatialSurfaceView @JvmOverloads constructor(
         sensorsManager.stop()
         arCoreSessionManager.pauseSession()
         dualCameraGLSurfaceView?.displayMode = DisplayMode.OBJECT
-        dualCameraGLSurfaceView?.detachCamera()
       }
       DisplayMode.AR, DisplayMode.MR -> {
         sensorsManager.start()
+        dualCameraGLSurfaceView?.arCoreSessionManager = arCoreSessionManager
+        dualCameraGLSurfaceView?.depthOcclusionManager = depthOcclusionManager
         dualCameraGLSurfaceView?.displayMode = displayMode
-        if (arCoreSessionManager.isArCorePackageInstalled()) {
-          try {
-            (context as? Activity)?.let { arCoreSessionManager.resumeSession(it) }
-          } catch (e: Exception) {
-            Log.w(TAG, "ARCore resume skipped: ${e.message}")
-          }
+        val currentTex = dualCameraGLSurfaceView?.textureId ?: 0
+        if (currentTex != 0) {
+          arCoreSessionManager.setCameraTextureName(currentTex)
+          (context as? Activity)?.let { arCoreSessionManager.resumeSession(it) }
         }
+        startRendering()
       }
     }
   }
@@ -348,10 +370,7 @@ class SpatialSurfaceView @JvmOverloads constructor(
         }
 
         DisplayMode.AR -> {
-          val frame = try { arCoreSessionManager.updateFrame() } catch (e: Exception) { null }
-          if (frame != null) {
-            dualCameraGLSurfaceView?.updateFromArCoreFrame(frame)
-          }
+          val frame = arCoreSessionManager.latestFrame
           if (frame != null && frame.camera.trackingState == TrackingState.TRACKING) {
             frame.camera.getProjectionMatrix(scratchProjMatrix, 0, 0.05f, 50.0f)
             frame.camera.getViewMatrix(scratchViewMatrix, 0)
@@ -374,6 +393,15 @@ class SpatialSurfaceView @JvmOverloads constructor(
                 }
               }
               depthOcclusionManager.processFrameDepth(frame, scratchAnchorPoses)
+              val activeDist = if (scratchAnchorPoses.isNotEmpty()) {
+                val pose = scratchAnchorPoses[0]
+                val camPos = latestTrackingData.cameraPosition
+                val dx = pose.tx() - camPos[0]
+                val dy = pose.ty() - camPos[1]
+                val dz = pose.tz() - camPos[2]
+                Math.sqrt((dx * dx + dy * dy + dz * dz).toDouble()).toFloat()
+              } else 1.2f
+              dualCameraGLSurfaceView?.virtualDepthMeters = activeDist
               filamentEngine.updateGpuDepthOcclusion(
                 textureId = depthOcclusionManager.depthTextureId,
                 width = depthOcclusionManager.depthWidth,
@@ -443,16 +471,20 @@ class SpatialSurfaceView @JvmOverloads constructor(
         }
 
         DisplayMode.MR -> {
-          val frame = try { arCoreSessionManager.updateFrame() } catch (e: Exception) { null }
-          if (frame != null) {
-            dualCameraGLSurfaceView?.updateFromArCoreFrame(frame)
-          }
+          val frame = arCoreSessionManager.latestFrame
           val hasValidTracking = frame != null && frame.camera.trackingState == TrackingState.TRACKING
-          if (hasValidTracking) {
-            frame!!.camera.getViewMatrix(scratchHeadPoseMatrix, 0)
-            scratchCamForward[0] = -scratchHeadPoseMatrix[2]
-            scratchCamForward[1] = -scratchHeadPoseMatrix[6]
-            scratchCamForward[2] = -scratchHeadPoseMatrix[10]
+          if (hasValidTracking && frame != null) {
+            frame.camera.getViewMatrix(scratchViewMatrix, 0)
+            if (android.opengl.Matrix.invertM(scratchHeadPoseMatrix, 0, scratchViewMatrix, 0)) {
+              System.arraycopy(scratchHeadPoseMatrix, 0, lastValidHeadPoseMatrix, 0, 16)
+              hasStoredHeadPose = true
+            }
+            scratchCamForward[0] = -scratchViewMatrix[2]
+            scratchCamForward[1] = -scratchViewMatrix[6]
+            scratchCamForward[2] = -scratchViewMatrix[10]
+          } else if (hasStoredHeadPose) {
+            // Decouple camera stream from tracking: retain last valid head pose during tracking loss
+            System.arraycopy(lastValidHeadPoseMatrix, 0, scratchHeadPoseMatrix, 0, 16)
           }
 
           // Process Depth in MR on time-based interval (~100ms)
@@ -462,10 +494,24 @@ class SpatialSurfaceView @JvmOverloads constructor(
             for (i in 0 until activeArAnchors.size) {
               val a = activeArAnchors[i]
               if (a.trackingState == TrackingState.TRACKING) {
+                anchorLastKnownPoses[a.hashCode()] = a.pose
                 scratchAnchorPoses.add(a.pose)
+              } else {
+                anchorLastKnownPoses[a.hashCode()]?.let { scratchAnchorPoses.add(it) }
               }
             }
             depthOcclusionManager.processFrameDepth(frame, scratchAnchorPoses)
+            filamentEngine.updateGpuDepthOcclusion(
+              textureId = depthOcclusionManager.depthTextureId,
+              width = depthOcclusionManager.depthWidth,
+              height = depthOcclusionManager.depthHeight,
+              timestampNs = depthOcclusionManager.latestDepthTimestampNs,
+              minDepth = depthOcclusionManager.minDepthMeters,
+              maxDepth = depthOcclusionManager.maxDepthMeters,
+              avgDepth = depthOcclusionManager.averageDepthMeters,
+              isReady = depthOcclusionManager.isDepthTextureReady,
+              occlusionPercentage = depthOcclusionManager.occlusionPercentage
+            )
           }
 
           // Synchronize all exhibit transforms with finger gestures (rotation, scale, position)
@@ -477,9 +523,14 @@ class SpatialSurfaceView @JvmOverloads constructor(
             val primaryAnchor = activeArAnchors.lastOrNull()
             if (primaryAnchor != null) {
               if (primaryAnchor.trackingState == TrackingState.TRACKING) {
+                anchorLastKnownPoses[primaryAnchor.hashCode()] = primaryAnchor.pose
                 filamentEngine.updateAnchorPose(currentAsset, primaryAnchor.pose)
+              } else {
+                // Hold at last valid pose during tracking pause or loss
+                anchorLastKnownPoses[primaryAnchor.hashCode()]?.let { lastPose ->
+                  filamentEngine.updateAnchorPose(currentAsset, lastPose)
+                }
               }
-              // Freeze when tracking lost
             } else {
               filamentEngine.updateUnanchoredPose(currentAsset, latestTrackingData.cameraPosition, scratchCamForward)
             }
@@ -490,7 +541,7 @@ class SpatialSurfaceView @JvmOverloads constructor(
           filamentEngine.renderStereoFrame(
             frameTimeNanos,
             ipdMeters,
-            if (hasValidTracking) scratchHeadPoseMatrix else null
+            if (hasValidTracking || hasStoredHeadPose) scratchHeadPoseMatrix else null
           )
         }
       }
@@ -528,30 +579,28 @@ class SpatialSurfaceView @JvmOverloads constructor(
 
           if (event.pointerCount == 1) {
             if (displayMode == DisplayMode.OBJECT) {
-              filamentEngine.orbitYaw += dx * 0.4f
-              filamentEngine.orbitPitch = (filamentEngine.orbitPitch - dy * 0.4f).coerceIn(-85f, 85f)
+              filamentEngine.orbitYaw += dx * 0.45f
+              filamentEngine.orbitPitch = (filamentEngine.orbitPitch - dy * 0.45f).coerceIn(-80f, 80f)
             } else {
-              // AR & MR: Seamless 1-finger gesture control
-              if (isOneFingerRotateMode || lastTouchY > height * 0.72f) {
-                // Rotation around vertical axis (Yaw)
+              // AR & MR: When model is placed/anchored, 1-finger gesture smoothly rotates in place
+              if (activeArAnchors.isNotEmpty()) {
                 filamentEngine.modelRotationDegrees += dx * 0.45f
-                // Up and Down (vertical altitude)
-                filamentEngine.modelOffsetY -= dy * 0.0025f
               } else {
-                // Right and Left (horizontal displacement)
-                filamentEngine.modelOffsetX += dx * 0.0025f
-                // Up and Down (vertical altitude)
-                filamentEngine.modelOffsetY -= dy * 0.0025f
+                if (isOneFingerRotateMode || lastTouchY > height * 0.72f) {
+                  filamentEngine.modelRotationDegrees += dx * 0.45f
+                } else {
+                  filamentEngine.modelOffsetX += dx * 0.0025f
+                  filamentEngine.modelOffsetY -= dy * 0.0025f
+                }
               }
             }
           } else if (event.pointerCount == 2) {
             if (displayMode == DisplayMode.OBJECT) {
-              filamentEngine.panX += dx * 0.005f
-              filamentEngine.panY -= dy * 0.005f
+              filamentEngine.panX = (filamentEngine.panX + dx * 0.003f).coerceIn(-0.35f, 0.35f)
+              filamentEngine.panY = (filamentEngine.panY - dy * 0.003f).coerceIn(-0.25f, 0.25f)
             } else {
-              // AR & MR: 2-finger horizontal drag rotates, vertical drag moves depth / distance
+              // AR & MR: 2-finger horizontal drag rotates
               filamentEngine.modelRotationDegrees += dx * 0.45f
-              filamentEngine.modelOffsetZ += dy * 0.003f
             }
           }
         }
@@ -589,8 +638,14 @@ class SpatialSurfaceView @JvmOverloads constructor(
   private fun handleTap(xPx: Float, yPx: Float) {
     if (displayMode == DisplayMode.AR || displayMode == DisplayMode.MR) {
       try {
+        val mappedX = if (displayMode == DisplayMode.MR && width > 0) {
+          val halfWidth = width / 2f
+          if (xPx > halfWidth) (xPx - halfWidth) * 2f else xPx * 2f
+        } else {
+          xPx
+        }
         val frame = arCoreSessionManager.latestFrame ?: return
-        val hit = arCoreSessionManager.hitTest(frame, xPx, yPx)
+        val hit = arCoreSessionManager.hitTest(frame, mappedX, yPx)
         if (hit != null) {
           val hitPose = hit.hitPose
           val hx = hitPose.tx()
@@ -615,21 +670,20 @@ class SpatialSurfaceView @JvmOverloads constructor(
 
           val anchor = arCoreSessionManager.createAnchor(hit)
           if (anchor != null) {
+            for (oldAnchor in activeArAnchors) {
+              try { oldAnchor.detach() } catch (_: Exception) {}
+            }
+            activeArAnchors.clear()
             activeArAnchors.add(anchor)
             val posArr = floatArrayOf(hx, hy, hz)
 
-            // Spawn as a new distinct scene exhibit on the plane
-            val glbBuffer = GltfAssetFactory.getPresetGlbBuffer(currentSelectedModelId)
-            if (glbBuffer != null) {
-              val exhibitId = "exhibit_plane_${currentSelectedModelId}_${System.currentTimeMillis()}"
-              filamentEngine.spawnExhibit(
-                exhibitId = exhibitId,
-                modelId = currentSelectedModelId,
-                title = currentSelectedModelTitle,
-                buffer = glbBuffer,
-                anchor = anchor,
-                source = ExhibitSource.PLANE_TAP
-              )
+            filamentEngine.clearAllExhibits()
+            val currentAsset = filamentEngine.currentAsset
+            if (currentAsset != null) {
+              filamentEngine.modelOffsetX = 0f
+              filamentEngine.modelOffsetY = 0f
+              filamentEngine.modelOffsetZ = 0f
+              filamentEngine.updateAnchorPose(currentAsset, anchor.pose)
             }
 
             onAnchorPlaced?.invoke(anchor, posArr, ExhibitSource.PLANE_TAP, currentSelectedModelId, currentSelectedModelTitle)
@@ -684,6 +738,7 @@ class SpatialSurfaceView @JvmOverloads constructor(
 
   fun clearModelAndScene() {
     filamentEngine.clearAll()
+    filamentEngine.clearGpuDepthAndTrackingResources()
     for (anchor in activeArAnchors) {
       anchor.detach()
     }
@@ -691,12 +746,15 @@ class SpatialSurfaceView @JvmOverloads constructor(
     spawnedMarkerIds.clear()
     currentSelectedModelId = ""
     currentSelectedModelTitle = ""
+    arCoreSessionManager.handleTrackingLostOrReset(resetSession = false)
     arCoreSessionManager.resetWalkingOrigin()
   }
 
   fun resetView() {
     filamentEngine.resetTransforms()
+    filamentEngine.clearGpuDepthAndTrackingResources()
     clearAnchors()
+    arCoreSessionManager.handleTrackingLostOrReset(resetSession = false)
     arCoreSessionManager.resetWalkingOrigin()
   }
 }

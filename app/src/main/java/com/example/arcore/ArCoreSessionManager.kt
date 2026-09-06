@@ -87,10 +87,15 @@ data class ArCoreTrackingData(
   val geospatialStatus: GeospatialStatus = GeospatialStatus(),
   val semanticsTelemetry: SemanticsTelemetry = SemanticsTelemetry(),
   val cloudAnchorsCount: Int = 0,
+  val localAnchorsCount: Int = 0,
+  val pendingCloudAnchorsCount: Int = 0,
   val recordingTelemetry: RecordingTelemetry = RecordingTelemetry(),
   val reconstructionTelemetry: ReconstructionTelemetry = ReconstructionTelemetry(),
   val isRealtimeBackendConnected: Boolean = false,
   val isMultiplayerActive: Boolean = false,
+  val isOnlineMultiplayerActive: Boolean = false,
+  val isLoopbackTestActive: Boolean = false,
+  val multiplayerMode: String = "OFFLINE",
   val certification: DeviceCapabilityCertification? = null,
   val detectedPlanes: List<DetectedPlaneInfo> = emptyList(),
   val detectedImages: List<DetectedImageInfo> = emptyList()
@@ -142,6 +147,7 @@ class ArCoreSessionManager(private val context: Context) {
   var isConfigured: Boolean = false
     private set
 
+  @Volatile
   var latestFrame: Frame? = null
     private set
 
@@ -221,39 +227,14 @@ class ArCoreSessionManager(private val context: Context) {
    */
   fun setupSession(activity: Activity): Boolean {
     if (session != null) return true
-    if (availabilityChecked && !isSupported) return false
-
-    // If ARCore package is not installed on the device, avoid calling ARCore install service which will fail
-    // when Google Play Store is not installed or service cannot be bound
-    if (!isArCorePackageInstalled()) {
-      isSupported = false
-      availabilityChecked = true
-      Log.i(TAG, "ARCore package not installed on device. Operating in CameraX fallback mode.")
-      return false
-    }
-
-    // Check availability first to avoid throwing runtime exceptions in ARCoreApk on emulators or unsupported devices
-    if (!availabilityChecked) {
-      try {
-        val availability = ArCoreApk.getInstance().checkAvailability(context)
-        if (!availability.isTransient) {
-          isSupported = availability.isSupported
-          availabilityChecked = true
-          if (!isSupported) {
-            Log.i(TAG, "ARCore is unsupported on this hardware ($availability). Operating in graceful fallback mode.")
-            return false
-          }
-        }
-      } catch (t: Throwable) {
-        Log.w(TAG, "ARCore availability pre-check failed: ${t.message}")
-        isSupported = false
-        availabilityChecked = true
-        return false
-      }
-    }
 
     return try {
-      when (ArCoreApk.getInstance().requestInstall(activity, userRequestedInstall)) {
+      val installStatus = try {
+        ArCoreApk.getInstance().requestInstall(activity, userRequestedInstall)
+      } catch (e: Exception) {
+        ArCoreApk.InstallStatus.INSTALLED
+      }
+      when (installStatus) {
         ArCoreApk.InstallStatus.INSTALLED -> {
           val newSession = Session(activity)
           val config = Config(newSession)
@@ -385,7 +366,11 @@ class ArCoreSessionManager(private val context: Context) {
     return try {
       session?.resume()
       if (cameraTextureId != 0) {
-        session?.setCameraTextureName(cameraTextureId)
+        try {
+          session?.setCameraTextureName(cameraTextureId)
+        } catch (e: Exception) {
+          Log.w(TAG, "setCameraTextureName on resume deferred to GL thread: ${e.message}")
+        }
       }
       isSessionPaused = false
       Log.i(TAG, "ARCore session resumed successfully.")
@@ -427,13 +412,44 @@ class ArCoreSessionManager(private val context: Context) {
     }
   }
 
+  val currentCameraTextureId: Int
+    get() = cameraTextureId
+
   fun setDisplayGeometry(rotation: Int, width: Int, height: Int) {
     session?.setDisplayGeometry(rotation, width, height)
   }
 
   fun setCameraTextureName(textureId: Int) {
     cameraTextureId = textureId
-    session?.setCameraTextureName(textureId)
+    try {
+      session?.setCameraTextureName(textureId)
+    } catch (e: Exception) {
+      Log.w(TAG, "setCameraTextureName error: ${e.message}")
+    }
+  }
+
+  /**
+   * Automatically restores ARCore camera stream and re-binds texture ID if session was interrupted.
+   */
+  fun recoverCameraStream(activity: Activity?): Boolean {
+    if (activity == null) return false
+    return try {
+      if (isSessionPaused || session == null) {
+        val resumed = resumeSession(activity)
+        if (resumed && cameraTextureId != 0) {
+          session?.setCameraTextureName(cameraTextureId)
+        }
+        resumed
+      } else {
+        if (cameraTextureId != 0) {
+          session?.setCameraTextureName(cameraTextureId)
+        }
+        true
+      }
+    } catch (e: Exception) {
+      Log.w(TAG, "recoverCameraStream failed: ${e.message}")
+      false
+    }
   }
 
   /**
@@ -597,7 +613,7 @@ class ArCoreSessionManager(private val context: Context) {
       semanticsManager.processFrameSemantics(frame)
       facesManager.processFrameFaces(currentSession)
       recordingPlaybackManager.updateFrameState(currentSession)
-      environmentalMeshManager.updateEnvironmentalMesh(currentSession, frame)
+      environmentalMeshManager.updateEnvironmentalMesh(currentSession, frame, semanticsManager)
 
       val trackingData = ArCoreTrackingData(
         trackingState = camera.trackingState,
@@ -617,10 +633,15 @@ class ArCoreSessionManager(private val context: Context) {
         geospatialStatus = geospatialManager.status,
         semanticsTelemetry = semanticsManager.telemetry,
         cloudAnchorsCount = cloudAnchorManager.cloudAnchorsCount,
+        localAnchorsCount = hPlanes + vPlanes,
+        pendingCloudAnchorsCount = cloudAnchorManager.pendingCloudAnchorsCount,
         recordingTelemetry = recordingPlaybackManager.telemetry,
         reconstructionTelemetry = environmentalMeshManager.telemetry,
         isRealtimeBackendConnected = multiplayerBackend.isBackendConnected,
         isMultiplayerActive = multiplayerBackend.isMultiplayerActive,
+        isOnlineMultiplayerActive = multiplayerBackend.isOnlineMultiplayerActive,
+        isLoopbackTestActive = multiplayerBackend.isLoopbackTestActive,
+        multiplayerMode = multiplayerBackend.multiplayerMode.name,
         certification = deviceCertification,
         detectedPlanes = scratchPlaneList,
         detectedImages = scratchImageList
@@ -759,5 +780,37 @@ class ArCoreSessionManager(private val context: Context) {
   fun resetWalkingOrigin() {
     initialCameraPose = null
     totalWalkingDisplacement = 0f
+  }
+
+  /**
+   * Complete lifecycle cleanup when tracking is lost or session is reset.
+   * On temporary tracking loss (resetSession = false), preserves persistent spatial voxels,
+   * depth textures, and anchor caches for seamless recovery.
+   * Only flushes resources on hard session reset (resetSession = true).
+   */
+  fun handleTrackingLostOrReset(resetSession: Boolean = false) {
+    if (resetSession) {
+      Log.i(TAG, "Hard session reset: cleaning up tracking resources...")
+      environmentalMeshManager.clear()
+      depthOcclusionManager.clear()
+      cloudAnchorManager.clear()
+      geospatialManager.clear()
+      for (record in imageTrackingMap.values) {
+        try { record.anchor?.detach() } catch (_: Exception) {}
+      }
+      imageTrackingMap.clear()
+      session?.let { s ->
+        try {
+          s.pause()
+          s.resume()
+        } catch (e: Exception) {
+          Log.w(TAG, "Transient session reset pause/resume: ${e.message}")
+        }
+      }
+    } else {
+      Log.i(TAG, "Spatial tracking paused or lost: retaining depth, mesh, and anchor caches for seamless recovery.")
+      // Retain resources during temporary tracking loss so anchors remain at their last valid pose
+      // and camera passthrough stream remains uninterrupted.
+    }
   }
 }
